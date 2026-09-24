@@ -1,11 +1,13 @@
 import argparse
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ try:
     from rich import box
     from rich.align import Align
     from rich.console import Console, Group
+    from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -23,6 +26,7 @@ except ImportError:
     box = None
     Align = None
     Group = None
+    Live = None
     Text = None
 
     def _strip_markup(value):
@@ -185,11 +189,23 @@ ALWAYS_IGNORE_SUFFIXES = {
 DEFAULT_CONFIG = {
     "default_course": "",
     "default_visibility": "public",
-    "force_push": False,
-    "include_support_files": True,
-    "auto_gitignore": True,
     "naming": "{name}-ss{session:02d}-{course}",
 }
+
+SECRET_PATTERNS = [
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS Access Key"),
+    (re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"), "Private key"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "API key (sk-...)"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "GitHub token (ghp_...)"),
+    (re.compile(r"(?i)(password|passwd|secret|api[_-]?key)\s*[:=]\s*[\"'][^\"'\s]{6,}[\"']"), "Hardcoded secret/password"),
+]
+
+SECRET_SCAN_SKIP_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".exe",
+    ".sqlite", ".sqlite3", ".db", ".woff", ".woff2", ".ttf", ".mp4",
+}
+
+MAX_FILE_SIZE_WARN_BYTES = 50 * 1024 * 1024
 
 STACK_GITIGNORES = {
     "python": "\n".join(
@@ -380,10 +396,6 @@ def slugify(value):
     return slug or "homework"
 
 
-def create_batch_repo_name(exercise, session, course, folder_name):
-    return f"{create_repo_name(exercise, session, course)}-{slugify(folder_name)}"
-
-
 def create_session_repo_name(file_path, session, course, naming=None):
     file_name = Path(file_path).stem
     if naming:
@@ -402,11 +414,6 @@ def create_session_repo_name(file_path, session, course, naming=None):
 
 def create_repo_topics(session, course):
     return ["homework", slugify(course), format_number("ss", session)]
-
-
-def preview(exercise, session, course):
-    repo_name = create_repo_name(exercise, session, course)
-    console.print(Panel(repo_name, title="Repository name", border_style="cyan"))
 
 
 def detect_stack(folder):
@@ -625,6 +632,64 @@ def show_history(course=None, session=None, limit=None):
     console.print(table)
 
 
+def get_last_history_repo():
+    history_file = get_history_file()
+    if not history_file.exists():
+        return None
+    try:
+        history = json.loads(history_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return history[-1] if history else None
+
+
+def delete_repo(repo_name, yes=False):
+    repo_name = str(repo_name).strip()
+    if not repo_name:
+        console.print("[red]Repository name is required.[/red]")
+        return
+
+    if not shutil.which("gh"):
+        console.print("[red]GitHub CLI (gh) not found.[/red]")
+        return
+
+    try:
+        username = get_github_username()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        console.print("[red]Chua dang nhap GitHub CLI. Chay: gh auth login[/red]")
+        return
+
+    full_name = f"{username}/{repo_name}"
+    if not github_repo_exists(username, repo_name):
+        console.print(f"[yellow]Repository not found:[/yellow] {full_name}")
+        return
+
+    if not ask_yes_no(f"Xoa vinh vien repo {full_name}? Hanh dong nay khong the hoan tac", yes=yes):
+        console.print("[yellow]Skipped.[/yellow]")
+        return
+
+    result = subprocess.run(["gh", "repo", "delete", full_name, "--yes"], check=False)
+    if result.returncode == 0:
+        console.print(f"[green]Deleted[/green] {full_name}")
+    else:
+        console.print(f"[red]Failed to delete[/red] {full_name}")
+
+
+def open_repo(repo_name=None):
+    if not shutil.which("gh"):
+        console.print("[red]GitHub CLI (gh) not found.[/red]")
+        return
+
+    if not repo_name:
+        last = get_last_history_repo()
+        if not last:
+            console.print("[yellow]No submission history yet. Provide a repo name.[/yellow]")
+            return
+        repo_name = last["repo_name"]
+
+    subprocess.run(["gh", "repo", "view", repo_name, "--web"], check=False)
+
+
 def should_ignore_name(name):
     if name.startswith("."):
         if name in {".gitignore", ".env", ".env.local"}:
@@ -674,6 +739,67 @@ def get_github_username():
         ["gh", "api", "user", "--jq", ".login"],
         text=True,
     ).strip()
+
+
+def ensure_github_auth():
+    result = subprocess.run(
+        ["gh", "auth", "status"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SubmissionSkipped(
+            "GitHub CLI chua dang nhap. Chay 'gh auth login' roi thu lai (hoac 'hw doctor')."
+        )
+
+
+def scan_for_secrets(folder):
+    findings = []
+    for path in list_uploadable_files(folder):
+        if path.suffix.lower() in SECRET_SCAN_SKIP_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for pattern, label in SECRET_PATTERNS:
+            if pattern.search(text):
+                findings.append((path, label))
+                break
+    return findings
+
+
+def scan_for_large_files(folder):
+    large = []
+    for path in list_uploadable_files(folder):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_FILE_SIZE_WARN_BYTES:
+            large.append((path, size))
+    return large
+
+
+def check_before_commit(folder, yes=False):
+    secrets = scan_for_secrets(folder)
+    if secrets:
+        console.print("[red]Canh bao: phat hien noi dung giong secret/API key:[/red]")
+        for path, label in secrets:
+            console.print(f"  - {path.name}: {label}")
+        if not ask_yes_no("Van tiep tuc nop bai?", yes=yes):
+            raise SubmissionSkipped("Da dung lai vi phat hien secret/API key trong file.")
+
+    large_files = scan_for_large_files(folder)
+    if large_files:
+        console.print("[yellow]Canh bao: co file lon (>50MB), GitHub co the tu choi push:[/yellow]")
+        for path, size in large_files:
+            console.print(f"  - {path.name}: {size / (1024 * 1024):.1f} MB")
+        if not ask_yes_no("Van tiep tuc nop bai?", yes=yes):
+            raise SubmissionSkipped("Da dung lai vi co file qua lon.")
 
 
 def github_repo_exists(username, repo_name):
@@ -747,15 +873,13 @@ def push_to_github(
     repo_url = f"https://github.com/{username}/{repo_name}"
     git_url = f"{repo_url}.git"
 
+    force_confirmed = overwrite or force_push
     if github_repo_exists(username, repo_name):
-        if not overwrite and not force_push:
+        if not force_confirmed:
             if not ask_yes_no(
                 f"Repository {repo_name} already exists. Overwrite with force push?",
                 yes=yes,
             ):
-                raise SubmissionSkipped(f"Skipped existing repository: {repo_name}")
-        elif not yes and not force_push:
-            if not ask_yes_no(f"Repository {repo_name} already exists. Overwrite it?"):
                 raise SubmissionSkipped(f"Skipped existing repository: {repo_name}")
         console.print("[yellow]Repository already exists. Force pushing latest files...[/yellow]")
         use_force = True
@@ -825,6 +949,9 @@ def submit_folder(
 
     if dry_run:
         console.print("[cyan]DRY-RUN mode: no git/github changes will be made.[/cyan]")
+    else:
+        ensure_github_auth()
+        check_before_commit(folder, yes=yes)
 
     if include_support_files:
         if not dry_run:
@@ -876,13 +1003,6 @@ def submit_folder(
         "repo_url": repo_url,
         "stack": stack,
     }
-
-
-def submit(exercise, session, course, visibility, **options):
-    try:
-        submit_folder(Path.cwd(), exercise, session, course, visibility, **options)
-    except SubmissionSkipped as error:
-        print(error)
 
 
 def warn_if_repo_name_invalid(repo_name):
@@ -947,6 +1067,8 @@ def up(repo_name, visibility, **options):
         )
     except SubmissionSkipped as error:
         print(error)
+    except subprocess.CalledProcessError as error:
+        console.print(f"[red]Failed to submit {repo_name}: {error}[/red]")
     finally:
         shutil.rmtree(temp_path, ignore_errors=True)
 
@@ -1001,13 +1123,22 @@ def copy_folder_to_temp_folder(source_folder, repo_name):
     return temp_path, repo_folder
 
 
-def build_up_session_items(folder):
+def apply_name_affixes(base_name, prefix=None, suffix=None):
+    name = base_name
+    if prefix:
+        name = f"{slugify(prefix)}-{name}"
+    if suffix:
+        name = f"{name}-{slugify(suffix)}"
+    return name
+
+
+def build_up_session_items(folder, prefix=None, suffix=None):
     entries = find_session_entries(folder)
     items = []
 
     for entry in entries:
         if entry.is_file():
-            repo_name = slugify(entry.stem)
+            repo_name = apply_name_affixes(slugify(entry.stem), prefix, suffix)
             items.append(
                 {
                     "path": entry,
@@ -1018,7 +1149,7 @@ def build_up_session_items(folder):
                 }
             )
         elif entry.is_dir():
-            repo_name = slugify(entry.name)
+            repo_name = apply_name_affixes(slugify(entry.name), prefix, suffix)
             mode = "project" if is_project_folder(entry) else "folder"
             items.append(
                 {
@@ -1034,10 +1165,10 @@ def build_up_session_items(folder):
     for item in items:
         base_name = item["repo_name"]
         repo_name = base_name
-        suffix = 2
+        dedup_counter = 2
         while repo_name in used_repo_names:
-            repo_name = f"{base_name}-{suffix}"
-            suffix += 1
+            repo_name = f"{base_name}-{dedup_counter}"
+            dedup_counter += 1
         item["repo_name"] = repo_name
         used_repo_names.add(repo_name)
 
@@ -1072,7 +1203,7 @@ def print_up_session_items(items):
     console.print(table)
 
 
-def up_split_folder(folder_name, visibility, **options):
+def up_split_folder(folder_name, visibility, prefix=None, suffix=None, **options):
     folder_name = str(folder_name).strip()
     if not folder_name:
         console.print("[red]Folder name is required.[/red]")
@@ -1090,7 +1221,7 @@ def up_split_folder(folder_name, visibility, **options):
         console.print(f"[red]Not a folder:[/red] {source_folder}")
         return
 
-    items = build_up_session_items(source_folder)
+    items = build_up_session_items(source_folder, prefix=prefix, suffix=suffix)
 
     if not items:
         console.print("[yellow]No homework files/folders found in the selected folder.[/yellow]")
@@ -1209,6 +1340,8 @@ def up_single_repo_folder(folder_name, visibility, repo_name=None, **options):
         )
     except SubmissionSkipped as error:
         print(error)
+    except subprocess.CalledProcessError as error:
+        console.print(f"[red]Failed to submit {repo_name}: {error}[/red]")
     finally:
         shutil.rmtree(temp_path, ignore_errors=True)
 
@@ -1217,8 +1350,8 @@ def up_session(folder_name, visibility, repo_name=None, **options):
     up_single_repo_folder(folder_name, visibility, repo_name=repo_name, **options)
 
 
-def up_folder(folder_name, visibility, **options):
-    up_split_folder(folder_name, visibility, **options)
+def up_folder(folder_name, visibility, prefix=None, suffix=None, **options):
+    up_split_folder(folder_name, visibility, prefix=prefix, suffix=suffix, **options)
 
 
 def up_project(folder_name, visibility, repo_name=None, **options):
@@ -1284,6 +1417,8 @@ def up_project(folder_name, visibility, repo_name=None, **options):
         )
     except SubmissionSkipped as error:
         print(error)
+    except subprocess.CalledProcessError as error:
+        console.print(f"[red]Failed to submit {repo_name}: {error}[/red]")
     finally:
         shutil.rmtree(temp_path, ignore_errors=True)
 
@@ -1384,6 +1519,8 @@ def submit_file(file_path, session, course, visibility, **options):
         )
     except SubmissionSkipped as error:
         print(error)
+    except subprocess.CalledProcessError as error:
+        console.print(f"[red]Failed to submit {repo_name}: {error}[/red]")
 
 
 def get_exercise_from_file_name(path):
@@ -1637,97 +1774,6 @@ def submit_session(session, course, visibility, **options):
     print_submission_summary(submitted, failed)
 
 
-def find_homework_folders(root):
-    folders = []
-
-    for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
-        if not path.is_dir():
-            continue
-        if path.name.startswith(".") or path.name in IGNORED_BATCH_FOLDERS:
-            continue
-        if should_ignore_name(path.name):
-            continue
-        folders.append(path)
-
-    return folders
-
-
-def batch_preview(exercise, session, course):
-    folders = find_homework_folders(Path.cwd())
-
-    if not folders:
-        console.print("[yellow]No homework folders found.[/yellow]")
-        return
-
-    table = Table(title="Repositories will be created")
-    table.add_column("Folder", style="bold")
-    table.add_column("Mode", style="yellow")
-    table.add_column("Stack", style="blue")
-    table.add_column("Repository", style="green")
-
-    for folder in folders:
-        repo_name = create_batch_repo_name(exercise, session, course, folder.name)
-        mode = "project" if is_project_folder(folder) else "folder"
-        table.add_row(folder.name, mode, detect_stack(folder), repo_name)
-
-    console.print(table)
-
-
-def batch_submit(exercise, session, course, visibility, **options):
-    folders = find_homework_folders(Path.cwd())
-
-    if not folders:
-        console.print("[yellow]No homework folders found.[/yellow]")
-        return
-
-    console.print(f"[bold]Found {len(folders)} homework folder(s).[/bold]")
-    console.print()
-
-    if options.get("dry_run"):
-        batch_preview(exercise, session, course)
-        console.print("[cyan]DRY-RUN:[/cyan] no push.")
-        return
-
-    submitted = []
-    failed = []
-
-    for folder in folders:
-        repo_name = create_batch_repo_name(exercise, session, course, folder.name)
-        console.rule(f"Submitting {folder.name}")
-
-        try:
-            submit_folder(
-                folder,
-                exercise,
-                session,
-                course,
-                visibility,
-                repo_name,
-                **options,
-            )
-            submitted.append(repo_name)
-        except SubmissionSkipped as error:
-            failed.append((repo_name, error))
-            console.print(f"[yellow]{error}[/yellow]")
-        except subprocess.CalledProcessError as error:
-            failed.append((repo_name, error))
-            console.print(f"[red]Failed to submit {repo_name}. Continuing...[/red]")
-
-        console.print()
-
-    console.print(Panel(
-        f"Submitted: {len(submitted)}\nFailed: {len(failed)}",
-        title="Batch submit finished",
-        border_style="green" if not failed else "yellow",
-    ))
-
-    if failed:
-        console.print()
-        console.print("[red]Failed repositories:[/red]")
-        for repo_name, _ in failed:
-            console.print(f"- {repo_name}")
-
-
 def get_command_output(command):
     result = subprocess.run(
         command,
@@ -1834,17 +1880,29 @@ Huong dan Homework Repo Tool
 6. Folder:
    hw up-session bai3-4          # ca folder = 1 repo
    hw up-folder ss05             # moi file/folder con = 1 repo
+   hw up-folder ss05 --prefix it105-ss17 --suffix tkn  # -> it105-ss17-bai1-tkn
    hw up ten-repo-tuy-chon       # folder hien tai
+   (Trong menu, chuc nang "Tach folder con" se hoi mon hoc / buoi / ten ban
+    roi tu dong ghep ten repo dang MONHOC-ssBUOI-tenbai-tenban)
 
 7. An toan:
    hw up-project app --dry-run   # chi xem, khong push
    hw submit-session 5 it205 --yes
    hw up-project app --overwrite # force push khi repo da ton tai
+   Tool se canh bao neu phat hien secret/API key hoac file qua lon truoc khi push.
 
 8. Lich su:
    hw history
    hw history --course it205
    hw history --session 5 --limit 10
+
+9. Xoa / mo repo:
+   hw delete ten-repo    # xoa han repo tren GitHub (khong hoan tac duoc)
+   hw open               # mo repo nop gan nhat tren trinh duyet
+   hw open ten-repo       # mo repo cu the
+
+10. Kiem tra tool con hoat dong dung khong:
+   pytest                 # chay bo test cho cac ham dat ten / loc file / canh bao
 
 Ghi chu:
 - Go "hw" de mo menu chon so, khong can nho lenh
@@ -1853,6 +1911,7 @@ Ghi chu:
 - README theo stack (FastAPI/Node/HTML)
 - Mac dinh KHONG force push; can --overwrite khi muon ghi de
 - up-project: 1 project = 1 repo, hop mon FastAPI / web
+- up-folder: dung --prefix/--suffix de moi lan nop khong bi trung ten repo
     """.strip()
     console.print(Panel(guide_text, title="Huong dan", border_style="cyan"))
 
@@ -1965,13 +2024,15 @@ def collect_menu_options():
     if visibility is None:
         return None
 
+    overwrite = prompt_yes_no_menu("Cho phep force push neu repo da ton tai?", default=False)
+
     return {
         "visibility": visibility,
         "options": {
-            "overwrite": False,
+            "overwrite": overwrite,
             "yes": False,
             "dry_run": False,
-            "force_push": False,
+            "force_push": overwrite,
         },
     }
 
@@ -1991,6 +2052,52 @@ def prompt_session_course():
         return None, None
 
     return session, course
+
+
+def spin_coin(initials="TK", cycles=2, fps=10):
+    """Hieu ung dong xu tron xoay, chu cai nguoi tao tool hien o giua."""
+    if not HAS_RICH or Live is None:
+        console.print(f"[bold yellow]{('(( ' + initials + ' ))')}[/bold yellow]")
+        return
+
+    # Vien dong xu la mot hinh oval CO DINH (khong bi bien thanh hinh chu nhat/vuong).
+    # Hieu ung "xoay" duoc tao bang cach doi chu o giua (TK -> T -> | -> K -> TK)
+    # va doi mau sac de tao cam giac anh sang phan chieu tren mat dong xu.
+    top = "   .------.   "
+    upper = "  /        \\  "
+    lower = "  \\        /  "
+    bottom = "   '------'   "
+    inner_width = 8
+    coin_width = len(top)
+
+    frames_per_cycle = 16
+    total_frames = frames_per_cycle * max(1, cycles)
+    colors = ["gold1", "yellow1", "khaki1", "gold3"]
+    first_letter = initials[:1] or "?"
+    second_letter = initials[1:2] or first_letter
+
+    try:
+        with Live(console=console, refresh_per_second=fps, transient=True) as live:
+            for frame in range(total_frames):
+                phase = frame % frames_per_cycle
+                cos_a = math.cos((2 * math.pi * phase) / frames_per_cycle)
+
+                if abs(cos_a) > 0.66:
+                    label = initials
+                elif abs(cos_a) > 0.2:
+                    label = first_letter if cos_a >= 0 else second_letter
+                else:
+                    label = "|"
+
+                color = colors[frame % len(colors)]
+                middle = f"|{label.center(inner_width)}|".center(coin_width)
+                art = "\n".join([top, upper, middle, lower, bottom])
+                live.update(Align.center(Text(art, style=f"bold {color}")))
+                time.sleep(1 / fps)
+    except KeyboardInterrupt:
+        pass
+
+    console.print("[dim]Tool duoc tao boi TK (Khang Nguyen)[/dim]", justify="center")
 
 
 def clear_screen():
@@ -2041,7 +2148,7 @@ def _menu_sections():
                 (
                     "6",
                     "Tach folder con",
-                    "Moi file/folder con o day = 1 repo",
+                    "Moi file/folder con = 1 repo (nhap mon hoc/buoi/ten de tu dat ten)",
                 ),
                 (
                     "7",
@@ -2057,6 +2164,9 @@ def _menu_sections():
                 ("9", "Config", "default_course, visibility, naming"),
                 ("10", "Doctor", "Kiem tra Git / gh / da login chua"),
                 ("11", "Huong dan", "Cach dung bang tieng Viet"),
+                ("12", "Mo repo", "Mo repo nop gan nhat (hoac ten tuy chon) tren trinh duyet"),
+                ("13", "Xoa repo", "Xoa han mot repo GitHub da nop nham"),
+                ("14", "Dong xu TK", "Xem hieu ung dong xu xoay - ten nguoi tao tool"),
                 ("0", "Thoat", "Thoat menu"),
             ],
         ),
@@ -2152,6 +2262,8 @@ def print_menu():
 
 
 def run_interactive_menu():
+    clear_screen()
+    spin_coin()
     while True:
         clear_screen()
         print_menu()
@@ -2261,10 +2373,32 @@ def run_interactive_menu():
             )
 
         elif choice == "6":
+            console.print(
+                "[dim]Nhap thong tin de tu dong dat ten repo dang: "
+                "MONHOC-ssBUOI-tenbai-tenban (vd: it105-ss17-bai1-tkn).[/dim]"
+            )
+            course = prompt_text("Ten mon hoc (vd: IT105, Enter = bo qua)", default="", required=False)
+            session = prompt_text("So buoi / session (vd: 17, Enter = bo qua)", default="", required=False)
+            student_name = prompt_text("Ten ban (vd: tkn, Enter = bo qua)", default="", required=False)
+
+            prefix_parts = []
+            if course:
+                prefix_parts.append(course)
+            if session:
+                prefix_parts.append(f"ss{session}")
+            prefix = "-".join(prefix_parts) or None
+            suffix = student_name or None
+
             settings = collect_menu_options()
             if not settings:
                 continue
-            up_folder(".", settings["visibility"], **settings["options"])
+            up_folder(
+                ".",
+                settings["visibility"],
+                prefix=prefix,
+                suffix=suffix,
+                **settings["options"],
+            )
 
         elif choice == "7":
             suggested = suggest_repo_name()
@@ -2314,6 +2448,23 @@ def run_interactive_menu():
         elif choice == "11":
             guide()
 
+        elif choice == "12":
+            repo_name = prompt_text(
+                "Ten repo (Enter = repo nop gan nhat)",
+                default="",
+                required=False,
+            )
+            open_repo(repo_name or None)
+
+        elif choice == "13":
+            repo_name = prompt_text("Ten repo can xoa", required=True)
+            if not repo_name:
+                continue
+            delete_repo(repo_name)
+
+        elif choice == "14":
+            spin_coin()
+
         else:
             console.print("[red]Lua chon khong hop le.[/red]")
 
@@ -2329,23 +2480,6 @@ def main():
     )
 
     subparsers = parser.add_subparsers(dest="command")
-
-    preview_parser = subparsers.add_parser(
-        "preview",
-        help="Xem ten repo theo format ex01-ss05-IT205",
-    )
-    preview_parser.add_argument("exercise")
-    preview_parser.add_argument("session")
-    preview_parser.add_argument("course")
-
-    submit_parser = subparsers.add_parser(
-        "submit",
-        help="Nop nguyen folder hien tai thanh mot repo",
-    )
-    submit_parser.add_argument("exercise")
-    submit_parser.add_argument("session")
-    submit_parser.add_argument("course")
-    add_common_flags(submit_parser)
 
     submit_file_parser = subparsers.add_parser(
         "submit-file",
@@ -2371,23 +2505,6 @@ def main():
     session_preview_parser.add_argument("session")
     session_preview_parser.add_argument("course", nargs="?", default=None)
     add_common_flags(session_preview_parser)
-
-    batch_preview_parser = subparsers.add_parser(
-        "batch-preview",
-        help="Xem truoc kieu nop moi folder con thanh mot repo",
-    )
-    batch_preview_parser.add_argument("exercise")
-    batch_preview_parser.add_argument("session")
-    batch_preview_parser.add_argument("course")
-
-    batch_submit_parser = subparsers.add_parser(
-        "batch-submit",
-        help="Nop moi folder con thanh mot repo",
-    )
-    batch_submit_parser.add_argument("exercise")
-    batch_submit_parser.add_argument("session")
-    batch_submit_parser.add_argument("course")
-    add_common_flags(batch_submit_parser)
 
     up_parser = subparsers.add_parser(
         "up",
@@ -2426,6 +2543,16 @@ def main():
         nargs="?",
         default=".",
         help="Folder can quet (mac dinh: folder hien tai).",
+    )
+    up_folder_parser.add_argument(
+        "--prefix",
+        default=None,
+        help="Them tien to vao ten moi repo con (vd: ss05 -> ss05-bai1).",
+    )
+    up_folder_parser.add_argument(
+        "--suffix",
+        default=None,
+        help="Them hau to vao ten moi repo con (vd: it205 -> bai1-it205).",
     )
     add_common_flags(up_folder_parser)
 
@@ -2478,6 +2605,19 @@ def main():
     subparsers.add_parser("guide", help="Huong dan su dung bang tieng Viet")
     subparsers.add_parser("menu", help="Mo menu tuong tac")
 
+    delete_parser = subparsers.add_parser(
+        "delete",
+        help="Xoa mot repo GitHub da nop nham",
+    )
+    delete_parser.add_argument("repo_name", help="Ten repo can xoa (vd: bai1-ss05-it205)")
+    delete_parser.add_argument("--yes", "-y", action="store_true", help="Khong hoi xac nhan")
+
+    open_parser = subparsers.add_parser(
+        "open",
+        help="Mo repo tren trinh duyet (mac dinh: repo nop gan nhat)",
+    )
+    open_parser.add_argument("repo_name", nargs="?", default=None, help="Ten repo can mo")
+
     args = parser.parse_args()
     options = extract_common_options(args)
 
@@ -2485,17 +2625,7 @@ def main():
         run_interactive_menu()
         return
 
-    if args.command == "preview":
-        preview(args.exercise, args.session, args.course)
-    elif args.command == "submit":
-        submit(
-            args.exercise,
-            args.session,
-            args.course,
-            resolve_visibility(args),
-            **options,
-        )
-    elif args.command == "submit-file":
+    if args.command == "submit-file":
         course = resolve_course(args.course)
         if not course:
             console.print("[red]Course is required (or set default_course in config).[/red]")
@@ -2513,16 +2643,6 @@ def main():
             console.print("[red]Course is required (or set default_course in config).[/red]")
             return
         session_preview(args.session, course, resolve_visibility(args), **options)
-    elif args.command == "batch-preview":
-        batch_preview(args.exercise, args.session, args.course)
-    elif args.command == "batch-submit":
-        batch_submit(
-            args.exercise,
-            args.session,
-            args.course,
-            resolve_visibility(args),
-            **options,
-        )
     elif args.command == "up":
         up(args.repo_name, resolve_visibility(args), **options)
     elif args.command == "up-session":
@@ -2533,7 +2653,13 @@ def main():
             **options,
         )
     elif args.command == "up-folder":
-        up_folder(args.folder, resolve_visibility(args), **options)
+        up_folder(
+            args.folder,
+            resolve_visibility(args),
+            prefix=args.prefix,
+            suffix=args.suffix,
+            **options,
+        )
     elif args.command == "up-project":
         project_options = dict(options)
         project_options["include_support_files"] = not args.no_readme
@@ -2556,6 +2682,10 @@ def main():
         doctor()
     elif args.command == "guide":
         guide()
+    elif args.command == "delete":
+        delete_repo(args.repo_name, yes=args.yes)
+    elif args.command == "open":
+        open_repo(args.repo_name)
     else:
         run_interactive_menu()
 
